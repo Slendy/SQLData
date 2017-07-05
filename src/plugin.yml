@@ -1,0 +1,8 @@
+name: SQLData
+author: Slendy
+description: Tracks different player statistics in an SQL database
+version: 1.0
+main: me.slendy.sqldata.SQLData
+commands:
+  info:
+    description: View info about player
