@@ -10,17 +10,16 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
-import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.sql.*;
 import java.text.DecimalFormat;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * ************************************************************************
@@ -40,13 +39,9 @@ public class SQLData extends JavaPlugin implements Listener, CommandExecutor {
         return _connection;
     }
 
-    private boolean _connected;
-
     private boolean _crash = false;
 
-    private HashMap<UUID, Long> _loginTimes = new HashMap<>();
-
-    private HashMap<UUID, Long> _lastOntime = new HashMap<>();
+    private List<SQLPlayer> _players = new ArrayList<>();
 
     @Override
     public void onEnable() {
@@ -65,26 +60,53 @@ public class SQLData extends JavaPlugin implements Listener, CommandExecutor {
         }
         getCommand("info").setExecutor(this);
         getServer().getPluginManager().registerEvents(this, this);
-        doAsync(this::setupTable);
-        for (Player p : Bukkit.getOnlinePlayers()) {
-            _loginTimes.put(p.getUniqueId(), System.currentTimeMillis());
-            doAsync(() -> {
-                openConnection();
+        getLogger().info("Initiating Database");
+        doAsync(() -> {
+            openConnection();
+            setupTable();
+            for (Player p : Bukkit.getOnlinePlayers()) {
                 try {
-                    PreparedStatement ontime = _connection.prepareStatement("SELECT ontime FROM `data` WHERE uuid=?;");
-                    ontime.setString(1, p.getUniqueId().toString().replace("-", ""));
-                    ResultSet result = ontime.executeQuery();
-                    result.next();
-                    _lastOntime.put(p.getUniqueId(), result.getLong("ontime"));
+                    PreparedStatement statement = _connection.prepareStatement("SELECT * FROM `data` WHERE uuid=?;");
+                    statement.setString(1, p.getUniqueId().toString());
+                    ResultSet result = statement.executeQuery();
+                    if (result.next()) {//if player exists, just in case
+                        _players.add(new SQLPlayer(p.getUniqueId(), System.currentTimeMillis(), result.getLong("ontime"), result.getInt("kills"), result.getInt("deaths")));
+                    } else {
+                        PreparedStatement newPlayer = _connection.prepareStatement("INSERT INTO `data` VALUES(?,0,0,0);");
+                        newPlayer.setString(1, p.getUniqueId().toString());
+                        _players.add(new SQLPlayer(p.getUniqueId(), System.currentTimeMillis(), 0, 0, 0));
+                        newPlayer.execute();
+                        newPlayer.close();
+                    }
                 } catch (SQLException e) {
                     e.printStackTrace();
                 }
-            });
+            }
+        });
+    }
+
+    @Override
+    public void onDisable() {
+        if (!_crash) {
+            getLogger().info("Saving player data");
+            try {
+                PreparedStatement ps = _connection.prepareStatement("UPDATE `data` SET ontime=?, kills=?, deaths=? WHERE uuid=?");
+                for (Player p : Bukkit.getOnlinePlayers()) {
+                    SQLPlayer player = getPlayer(p.getUniqueId());
+                    ps.setLong(1, (System.currentTimeMillis() - player.getLoginTime()) + player.getPreviousOnTime());
+                    ps.setInt(2, player.getKills());
+                    ps.setInt(3, player.getDeaths());
+                    ps.setString(4, p.getUniqueId().toString());
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
         }
     }
 
-    private static double trim(int degree, double d)
-    {
+    private static double trim(int degree, double d) {
         StringBuilder format = new StringBuilder("#.#");
         for (int i = 1; i < degree; i++) {
             format.append("#");
@@ -109,69 +131,20 @@ public class SQLData extends JavaPlugin implements Listener, CommandExecutor {
         Bukkit.getScheduler().runTaskAsynchronously(this, r);
     }
 
-
-    @Override
-    public void onDisable() {
-        if(!_crash) {
-            getLogger().info("Saving player data");
-            openConnection();
-            try {
-                PreparedStatement ps = _connection.prepareStatement("UPDATE `data` SET ontime=? WHERE uuid=?");
-                for (Player p : Bukkit.getOnlinePlayers()) {
-                    ps.setLong(1, _lastOntime.get(p.getUniqueId()) + (System.currentTimeMillis() - _loginTimes.get(p.getUniqueId())));
-                    ps.setString(2, p.getUniqueId().toString().replace("-", ""));
-                    ps.addBatch();
-                }
-                ps.executeBatch();
-            } catch (Exception e) {
-                e.printStackTrace();
-            } finally {
-                closeConnection();
-            }
-
-            try {
-                if (_connection != null && !_connection.isClosed()) {
-                    _connection.close();
-                }
-            } catch (SQLException e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
-    private void getPlayerStats(CommandSender sender, UUID u){
-        doAsync(() -> {
-            openConnection();
-            try {
-                PreparedStatement statement = _connection.prepareStatement("SELECT * FROM `data` WHERE uuid=?;");
-                statement.setString(1, u.toString().replace("-", ""));
-
-                ResultSet result = statement.executeQuery();
-                result.next();
-                sender.sendMessage("§7UUID: §f" + result.getString("uuid"));
-                sender.sendMessage("§7Username: §f" + Bukkit.getOfflinePlayer(u).getName());
-                sender.sendMessage("§7Kills: §f" + result.getInt("kills"));
-                sender.sendMessage("§7Deaths: §f" + result.getInt("deaths"));
-                sender.sendMessage("§7Ontime: §f" + convertString(result.getLong("ontime"), 1));
-                sender.sendMessage("§eTIP> §fRelog to update your ontime.");
-
-            } catch (SQLException e) {
-                e.printStackTrace();
-            }
-
-        });
-    }
-
-
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
             if (sender instanceof Player) {
-                Player player = (Player) sender;
-                player.sendMessage("§eFetching player data...");
-                doAsync(() -> {
-                    getPlayerStats(player, player.getUniqueId());
-                });
+                SQLPlayer player = getPlayer(((Player) sender).getUniqueId());
+                if (player == null) {
+                    sender.sendMessage("§cAn error has occurred.");
+                    return true;
+                }
+                sender.sendMessage("§ePlayer data for " + sender.getName());
+                sender.sendMessage("§7UUID: §f" + player.getUuid());
+                sender.sendMessage("§7Kills: §f" + player.getKills());
+                sender.sendMessage("§7Deaths: §f" + player.getDeaths());
+                sender.sendMessage("§7Ontime: §f" + convertString(player.getPreviousOnTime() + (System.currentTimeMillis() - player.getLoginTime()), 1));
             } else {
                 sender.sendMessage("§cInvalid command usage! /info <player>");
             }
@@ -179,43 +152,58 @@ public class SQLData extends JavaPlugin implements Listener, CommandExecutor {
         }
         if (args.length == 1) {
             OfflinePlayer p = Bukkit.getOfflinePlayer(args[0]);
+            SQLPlayer player = getPlayer(p.getUniqueId());
+            if (player == null) {
+                sender.sendMessage("§eFetching player data...");
+                doAsync(() -> {
 
-            sender.sendMessage("§eFetching player data...");
 
-            doAsync(() -> {
-                if(!dataContainsPlayer(p.getUniqueId())){
-                    sender.sendMessage("§cThat player doesn't exist in the database.");
-                } else {
-                    getPlayerStats(sender, p.getUniqueId());
-                }
-
-            });
-
+                    try {
+                        PreparedStatement statement = _connection.prepareStatement("SELECT * FROM `data` WHERE uuid=?;");
+                        statement.setString(1, p.getUniqueId().toString());
+                        ResultSet result = statement.executeQuery();
+                        if (result.next()) {
+                            sender.sendMessage("§ePlayer data for " + p.getName());
+                            sender.sendMessage("§7UUID: §f" + result.getString("uuid"));
+                            sender.sendMessage("§7Kills: §f" + result.getInt("kills"));
+                            sender.sendMessage("§7Deaths: §f" + result.getInt("deaths"));
+                            sender.sendMessage("§7Ontime: §f" + convertString(result.getLong("ontime"), 1));
+                        } else {
+                            sender.sendMessage("§cThat player doesn't exist in the database.");
+                            return;
+                        }
+                    } catch (SQLException e) {
+                        e.printStackTrace();
+                    }
+                });
+            } else {
+                sender.sendMessage("§ePlayer data for " + p.getName());
+                sender.sendMessage("§7UUID: §f" + player.getUuid());
+                sender.sendMessage("§7Kills: §f" + player.getKills());
+                sender.sendMessage("§7Deaths: §f" + player.getDeaths());
+                sender.sendMessage("§7Ontime: §f" + convertString(player.getPreviousOnTime() + (System.currentTimeMillis() - player.getLoginTime()), 1));
+            }
         }
         return true;
     }
 
     private synchronized void setupTable() {
         try {
-            openConnection();
             PreparedStatement create = _connection.prepareStatement("CREATE TABLE IF NOT EXISTS `data` (\n" +
-                    " `uuid` varchar(33) NOT NULL,\n" +
-                    " `kills` int(11) NOT NULL,\n" +
-                    " `deaths` int(11) NOT NULL,\n" +
-                    " `ontime` bigint(20) NOT NULL\n" +
+                    " `uuid` VARCHAR(37) NOT NULL,\n" +
+                    " `kills` INT(11) NOT NULL,\n" +
+                    " `deaths` INT(11) NOT NULL,\n" +
+                    " `ontime` BIGINT(20) NOT NULL\n" +
                     ") ENGINE=MyISAM DEFAULT CHARSET=latin1");
             create.executeUpdate();
         } catch (SQLException e) {
             e.printStackTrace();
-        } finally {
-            getLogger().info("Database initiated");
         }
     }
 
     private synchronized void closeConnection() {
         try {
             _connection.close();
-            _connected = false;
         } catch (SQLException e) {
             e.printStackTrace();
         }
@@ -223,55 +211,56 @@ public class SQLData extends JavaPlugin implements Listener, CommandExecutor {
 
 
     private synchronized void openConnection() {
-        if (_connected) {
-            return;
-        }
         try {
-            _connection = DriverManager.getConnection("jdbc:mysql://" + getConfig().get("database.ip") + ":3306/" + getConfig().getString("database.name"),
-                    getConfig().getString("database.username"),
-                    getConfig().getString("database.password"));
-            _connected = true;
-        } catch (SQLException e) {
-            e.printStackTrace();
+            _connection = DriverManager.getConnection("jdbc:mysql://" + getConfig().getString("database.ip") + ":3306/" + getConfig().getString("database.name")
+                    + "?user=" + getConfig().getString("database.username")
+                    + "&password=" + getConfig().getString("database.password")
+                    + "&autoReconnect=true");
+        } catch (Exception e) {
+            _crash = true;
+            getServer().getPluginManager().disablePlugin(this);
+            getLogger().info("Could not establish connection to database.");
+//            e.printStackTrace();
         }
     }
 
-    private synchronized boolean dataContainsPlayer(UUID uuid) {
-        openConnection();
-        try {
-
-            PreparedStatement ps = _connection.prepareStatement("SELECT * FROM `data` WHERE uuid=?;");
-            ps.setString(1, uuid.toString().replace("-", ""));
-
-            ResultSet resultSet = ps.executeQuery();
-            boolean containsPlayer = resultSet.next();
-
-            ps.close();
-            resultSet.close();
-            return containsPlayer;
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
+    public SQLPlayer getPlayer(UUID u) {
+        for (SQLPlayer p : _players) {
+            if (p.getUuid() == u) {
+                return p;
+            }
         }
+        return null;
     }
 
     @EventHandler
-    public void onJoin(PlayerJoinEvent event) {
-        _loginTimes.put(event.getPlayer().getUniqueId(), System.currentTimeMillis());
+    public void onLogin(AsyncPlayerPreLoginEvent event) {
         doAsync(() -> {
             try {
-                openConnection();
-                if (!dataContainsPlayer(event.getPlayer().getUniqueId())) {
-                    PreparedStatement newPlayer = _connection.prepareStatement("INSERT INTO `data` values(?,0,0,0);");
-                    newPlayer.setString(1, event.getPlayer().getUniqueId().toString().replace("-", ""));
+                if (_connection == null || _connection.isClosed()) {
+                    event.setLoginResult(AsyncPlayerPreLoginEvent.Result.KICK_OTHER);
+                    event.setKickMessage("§cThe server is still starting up\n §rplease join back in a second.");
+                    event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, "§cThe server is still starting up\n §rplease join back in a second.");
+                    return;
+                }
+            } catch (SQLException e) {
+                e.printStackTrace();
+            }
+            try {
+                PreparedStatement statement = _connection.prepareStatement("SELECT * FROM `data` WHERE uuid=?;");
+                statement.setString(1, event.getUniqueId().toString());
+                ResultSet result = statement.executeQuery();
+                boolean playerExists = result.next();
+                if (playerExists) {
+                    _players.add(new SQLPlayer(event.getUniqueId(), System.currentTimeMillis(), result.getLong("ontime"), result.getInt("kills"), result.getInt("deaths")));
+                    result.close();
+                    statement.close();
+                } else {
+                    PreparedStatement newPlayer = _connection.prepareStatement("INSERT INTO `data` VALUES(?,0,0,0);");
+                    newPlayer.setString(1, event.getUniqueId().toString());
                     newPlayer.execute();
                     newPlayer.close();
-                } else {
-                    PreparedStatement ontime = _connection.prepareStatement("SELECT ontime FROM `data` WHERE uuid=?;");
-                    ontime.setString(1, event.getPlayer().getUniqueId().toString().replace("-", ""));
-                    ResultSet result = ontime.executeQuery();
-                    result.next();
-                    _lastOntime.put(event.getPlayer().getUniqueId(), result.getLong("ontime"));
+                    _players.add(new SQLPlayer(event.getUniqueId(), System.currentTimeMillis(), 0, 0, 0));
                 }
             } catch (SQLException e) {
                 e.printStackTrace();
@@ -281,103 +270,47 @@ public class SQLData extends JavaPlugin implements Listener, CommandExecutor {
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        if(_loginTimes.get(event.getPlayer().getUniqueId()) == null){
-            return;
-        }
+        SQLPlayer player = getPlayer(event.getPlayer().getUniqueId());
         doAsync(() -> {
-            _lastOntime.remove(event.getPlayer().getUniqueId());
-            openConnection();
             try {
-                long ontime = _loginTimes.get(event.getPlayer().getUniqueId());
-                long timeSpent = System.currentTimeMillis() - ontime;
-                System.out.println(timeSpent);
-                PreparedStatement ps = _connection.prepareStatement("SELECT ontime FROM `data` WHERE uuid=?;");
-                ps.setString(1, event.getPlayer().getUniqueId().toString().replace("-", ""));
-                ResultSet result = ps.executeQuery();
-                result.next();
-
-                ontime = result.getLong("ontime");
-
-                PreparedStatement onTimeUpdate = _connection.prepareStatement("UPDATE `data` SET ontime=? WHERE uuid=?;");
-                onTimeUpdate.setLong(1, ontime + timeSpent);
-                onTimeUpdate.setString(2, event.getPlayer().getUniqueId().toString().replace("-", ""));
-                onTimeUpdate.executeUpdate();
-                onTimeUpdate.close();
-                ps.close();
-                result.close();
-
-            } catch (Exception e) {
+                if (_connection == null || _connection.isClosed()) {
+                    return;
+                }
+            } catch (SQLException e) {
+                e.printStackTrace();
+            }
+            try {
+                PreparedStatement statement = _connection.prepareStatement("UPDATE `data` SET ontime=?, kills=?, deaths=? WHERE uuid=?;");
+                statement.setLong(1, (System.currentTimeMillis() - player.getLoginTime()) + player.getPreviousOnTime());
+                statement.setInt(2, player.getKills());
+                statement.setInt(3, player.getDeaths());
+                statement.setString(4, player.getUuid().toString());
+                statement.executeUpdate();
+            } catch (SQLException e) {
                 e.printStackTrace();
             }
         });
     }
 
     @EventHandler
-    public void onKill(EntityDamageByEntityEvent e){
-        if(e.getEntity() == null || e.getDamager() == null){
+    public void onKill(EntityDamageByEntityEvent event) {
+        if (event.getEntity() == null || event.getDamager() == null) {
             return;
         }
-        if(!(e.getEntity() instanceof Player) || !(e.getDamager() instanceof Player)){
+        if (!(event.getEntity() instanceof Player) || !(event.getDamager() instanceof Player)) {
             return;
         }
-        if(((Player) e.getEntity()).getHealth() > 0 && ((Player) e.getEntity()).getHealth() - e.getDamage() > 0) {
+        if (((Player) event.getEntity()).getHealth() > 0 && ((Player) event.getEntity()).getHealth() - event.getDamage() > 0) {
             return;
         }
-
-        doAsync(() -> {
-            openConnection();
-            try{
-                PreparedStatement ps = _connection.prepareStatement("SELECT kills FROM `data` WHERE uuid=?;");
-                ps.setString(1, e.getDamager().getUniqueId().toString().replace("-", ""));
-                ResultSet result = ps.executeQuery();
-                result.next();
-
-                int previousKills = result.getInt("kills");
-
-                PreparedStatement killsUpdate = _connection.prepareStatement("UPDATE `data` SET kills=? WHERE uuid=?;");
-                killsUpdate.setInt(1, previousKills + 1);
-                killsUpdate.setString(2, e.getDamager().getUniqueId().toString().replace("-", ""));
-                killsUpdate.executeUpdate();
-
-                ps.close();
-                result.close();
-                killsUpdate.close();
-            }catch(Exception ex){
-                ex.printStackTrace();
-            }
-        });
-
+        getPlayer(event.getEntity().getUniqueId()).incrementKills();
     }
-
 
     @EventHandler
     public void onDeath(PlayerDeathEvent event) {
         if (event.getEntity() != null && event.getEntity() instanceof Player) {
-            doAsync(() -> {
-                openConnection();
-                try {
-                    PreparedStatement ps = _connection.prepareStatement("SELECT deaths FROM `data` WHERE uuid=?;");
-                    ps.setString(1, event.getEntity().getUniqueId().toString().replace("-", ""));
-                    ResultSet result = ps.executeQuery();
-                    result.next();
-
-                    int previousDeaths = result.getInt("deaths");
-
-                    PreparedStatement deathsUpdate = _connection.prepareStatement("UPDATE `data` SET deaths=? WHERE uuid=?;");
-                    deathsUpdate.setInt(1, previousDeaths + 1);
-                    deathsUpdate.setString(2, event.getEntity().getUniqueId().toString().replace("-", ""));
-                    deathsUpdate.executeUpdate();
-
-                    ps.close();
-                    result.close();
-                    deathsUpdate.close();
-
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            });
+            getPlayer(event.getEntity().getUniqueId()).incrementDeaths();
         }
     }
-
 
 }
